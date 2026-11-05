@@ -1,11 +1,14 @@
+import time
 import unittest
 from analysis import analyze_pair
 
 class AnalysisTests(unittest.TestCase):
     def setUp(self):
         self.pair = {
-            "priceUsd": "1.0", "pairCreatedAt": 1793890000000,
-            "liquidity": {"usd": 60000}, "volume": {"m5": 80000},
+            "priceUsd": "1.0",
+            "pairCreatedAt": int(time.time() * 1000) - 15 * 60 * 1000,
+            "liquidity": {"usd": 60000},
+            "volume": {"m5": 80000},
             "txns": {"m5": {"buys": 120, "sells": 50}},
             "priceChange": {"m5": 3, "h1": 12},
         }
