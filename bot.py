@@ -3,6 +3,7 @@ import time
 import sqlite3
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -57,7 +58,11 @@ def db():
     c.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value REAL NOT NULL)")
     c.execute("""CREATE TABLE IF NOT EXISTS positions (
         mint TEXT PRIMARY KEY, symbol TEXT, name TEXT, entry REAL,
-        amount REAL, opened TEXT, status TEXT)""")
+        amount REAL, opened TEXT, status TEXT, pair_address TEXT)""")
+    # Safe migration for databases created by earlier bot versions.
+    columns = {row[1] for row in c.execute("PRAGMA table_info(positions)").fetchall()}
+    if "pair_address" not in columns:
+        c.execute("ALTER TABLE positions ADD COLUMN pair_address TEXT")
     c.execute("""CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY, mint TEXT, symbol TEXT, side TEXT,
         price REAL, amount REAL, pnl REAL, at TEXT, note TEXT)""")
@@ -95,8 +100,14 @@ def recently_sold(c, mint):
 
 def open_positions(c):
     return c.execute(
-        "SELECT mint, symbol, entry, amount FROM positions WHERE status='OPEN'"
+        "SELECT mint, symbol, entry, amount, pair_address FROM positions WHERE status='OPEN'"
     ).fetchall()
+
+
+def fetch_pairs_timed(mint):
+    started = time.monotonic()
+    pairs = get_pairs(mint)
+    return pairs, time.monotonic() - started
 
 def close_position(c, mint, pair, reason):
     row = c.execute(
@@ -130,29 +141,73 @@ def close_position(c, mint, pair, reason):
 
 def monitor_open_positions(c):
     snapshots = []
-    for mint, symbol, entry, amount in open_positions(c):
-        try:
-            pairs = get_pairs(mint)
-            if not pairs:
-                logging.warning("OPEN POSITION has no pair data; keeping it open: %s", symbol)
-                continue
-            pair = pairs[0]
-            price = float(pair.get("priceUsd") or 0)
-            if price <= 0:
-                logging.warning("Invalid price for open position %s; keeping it open", symbol)
-                continue
-            change = price / entry - 1
-            invested = (amount * entry) / max(0.000001, (1 - FEE))
-            estimated_exit = amount * price * (1 - FEE - SLIP)
-            estimated_pnl = estimated_exit - invested
-            if change <= -STOP:
-                close_position(c, mint, pair, "stop-loss threshold observed")
-            elif change >= TAKE:
-                close_position(c, mint, pair, "take-profit threshold observed")
-            else:
-                snapshots.append((symbol, change * 100, estimated_pnl))
-        except Exception as exc:
-            logging.warning("Position monitor failed for %s: %s", symbol, exc)
+    rows = open_positions(c)
+    if not rows:
+        return snapshots
+
+    # Fetch prices concurrently: one slow token request should not block every
+    # other open position. Database writes remain on this thread.
+    workers = min(8, len(rows))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(fetch_pairs_timed, row[0]): row for row in rows}
+        for future in as_completed(futures):
+            mint, symbol, entry, amount, saved_pair_address = futures[future]
+            try:
+                pairs, request_seconds = future.result()
+                if request_seconds > MONITOR_INTERVAL:
+                    logging.warning(
+                        "SLOW PRICE REQUEST %s | %.2fs (monitor target %ss)",
+                        symbol, request_seconds, MONITOR_INTERVAL
+                    )
+                if not pairs:
+                    logging.warning("OPEN POSITION has no pair data; keeping it open: %s", symbol)
+                    continue
+
+                # Keep monitoring the same liquidity pool used at entry.
+                # Never silently switch to another pool's price.
+                if saved_pair_address:
+                    pair = next((p for p in pairs if p.get("pairAddress") == saved_pair_address), None)
+                    if pair is None:
+                        logging.warning(
+                            "SAVED PAIR MISSING for %s | keeping position open; refusing pool switch",
+                            symbol
+                        )
+                        continue
+                else:
+                    pair = pairs[0]
+                    saved_pair_address = pair.get("pairAddress")
+                    if saved_pair_address:
+                        c.execute(
+                            "UPDATE positions SET pair_address=? WHERE mint=? AND status='OPEN'",
+                            (saved_pair_address, mint)
+                        )
+                        c.commit()
+                        logging.info("LEGACY POSITION pinned to pair %s | %s",
+                                     saved_pair_address[:10], symbol)
+
+                price = float(pair.get("priceUsd") or 0)
+                if price <= 0:
+                    logging.warning("Invalid price for open position %s; keeping it open", symbol)
+                    continue
+
+                change = price / entry - 1
+                invested = (amount * entry) / max(0.000001, (1 - FEE))
+                estimated_exit = amount * price * (1 - FEE - SLIP)
+                estimated_pnl = estimated_exit - invested
+                net_pct = (estimated_pnl / invested * 100) if invested else 0.0
+                logging.debug(
+                    "PRICE CHECK %s | pair=%s | price=$%.10f | move=%+.2f%% | est.net=%+.2f%%",
+                    symbol, (saved_pair_address or "unknown")[:10], price, change * 100, net_pct
+                )
+
+                if change <= -STOP:
+                    close_position(c, mint, pair, "stop-loss threshold observed")
+                elif change >= TAKE:
+                    close_position(c, mint, pair, "take-profit threshold observed")
+                else:
+                    snapshots.append((symbol, change * 100, estimated_pnl))
+            except Exception as exc:
+                logging.warning("Position monitor failed for %s: %s", symbol, exc)
     return snapshots
 
 def consider_buy(c, profile, pair):
@@ -179,9 +234,12 @@ def consider_buy(c, profile, pair):
     amount = (SIZE * (1 - FEE)) / effective_price
     now = datetime.now(timezone.utc).isoformat()
     c.execute("UPDATE state SET value=? WHERE key='cash'", (cash - SIZE,))
+    pair_address = pair.get("pairAddress")
     c.execute(
-        "INSERT INTO positions VALUES(?,?,?,?,?,?,?)",
-        (mint, symbol, name, effective_price, amount, now, "OPEN")
+        """INSERT INTO positions
+           (mint, symbol, name, entry, amount, opened, status, pair_address)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (mint, symbol, name, effective_price, amount, now, "OPEN", pair_address)
     )
     c.execute(
         "INSERT INTO trades(mint,symbol,side,price,amount,pnl,at,note) VALUES(?,?,?,?,?,?,?,?)",
