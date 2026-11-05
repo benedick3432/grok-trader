@@ -145,11 +145,12 @@ def monitor_open_positions(c):
             invested = (amount * entry) / max(0.000001, (1 - FEE))
             estimated_exit = amount * price * (1 - FEE - SLIP)
             estimated_pnl = estimated_exit - invested
-            snapshots.append((symbol, change * 100, estimated_pnl))
             if change <= -STOP:
                 close_position(c, mint, pair, "stop-loss threshold observed")
             elif change >= TAKE:
                 close_position(c, mint, pair, "take-profit threshold observed")
+            else:
+                snapshots.append((symbol, change * 100, estimated_pnl))
         except Exception as exc:
             logging.warning("Position monitor failed for %s: %s", symbol, exc)
     return snapshots
@@ -202,14 +203,20 @@ def report(c, snapshots=None):
     ).fetchone()[0])
     daily = daily_realized_pnl(c)
     paused = daily <= -DAILY_LIMIT
-    unrealized = sum(item[2] for item in (snapshots or []))
-    logging.info(
-        "PORTFOLIO | cash=$%.2f | open positions=%d | est. unrealized PnL=$%+.2f | realized PnL=$%+.2f | daily PnL=$%+.2f | new buys=%s",
-        cash, len(positions), unrealized, realized, daily,
-        "PAUSED" if paused else "ENABLED"
-    )
-    for symbol, change_pct, pnl in (snapshots or []):
-        logging.info("OPEN POSITION %s | price change=%+.2f%% | estimated net PnL=$%+.2f", symbol, change_pct, pnl)
+    if snapshots is None:
+        logging.info(
+            "PORTFOLIO | cash=$%.2f | open positions=%d | realized PnL=$%+.2f | daily PnL=$%+.2f | new buys=%s",
+            cash, len(positions), realized, daily, "PAUSED" if paused else "ENABLED"
+        )
+    else:
+        unrealized = sum(item[2] for item in snapshots)
+        logging.info(
+            "PORTFOLIO | cash=$%.2f | open positions=%d | est. unrealized PnL=$%+.2f | realized PnL=$%+.2f | daily PnL=$%+.2f | new buys=%s",
+            cash, len(positions), unrealized, realized, daily,
+            "PAUSED" if paused else "ENABLED"
+        )
+        for symbol, change_pct, pnl in snapshots:
+            logging.info("OPEN POSITION %s | price change=%+.2f%% | estimated net PnL=$%+.2f", symbol, change_pct, pnl)
 
 def monitor_worker(stop_event):
     c = connect_db()
