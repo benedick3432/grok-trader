@@ -70,7 +70,8 @@ def paper_cycle(c, profile, pair):
         if change <= -STOP or change >= TAKE:
             proceeds = amount * price * (1 - FEE - SLIP)
             cash = c.execute("SELECT value FROM state WHERE key='cash'").fetchone()[0]
-            invested = (amount * entry) / (1 - FEE)\n            pnl = proceeds - invested
+            invested = (amount * entry) / (1 - FEE)
+            pnl = proceeds - invested
             c.execute("UPDATE state SET value=? WHERE key='cash'", (cash + proceeds,))
             c.execute("UPDATE positions SET status='CLOSED' WHERE mint=?", (mint,))
             c.execute("INSERT INTO trades(mint,symbol,side,price,amount,pnl,at,note) VALUES(?,?,?,?,?,?,?,?)",
