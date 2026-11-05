@@ -213,19 +213,21 @@ def monitor_open_positions(c):
 def consider_buy(c, profile, pair):
     mint = profile["tokenAddress"]
     if c.execute("SELECT 1 FROM positions WHERE mint=? AND status='OPEN'", (mint,)).fetchone():
-        return
+        return {"status": "already_open"}
     if recently_sold(c, mint):
-        return
+        return {"status": "cooldown"}
     analysis = analyze_pair(pair, MIN_LIQ, MIN_VOL, MIN_TXNS, MAX_AGE, MIN_SCORE)
     m = analysis["metrics"]
     if not analysis["eligible"]:
-        return
+        return {"status": "filtered", "analysis": analysis}
     if daily_realized_pnl(c) <= -DAILY_LIMIT:
-        return
+        return {"status": "daily_limit", "analysis": analysis}
     count = c.execute("SELECT COUNT(*) FROM positions WHERE status='OPEN'").fetchone()[0]
     cash = float(c.execute("SELECT value FROM state WHERE key='cash'").fetchone()[0])
-    if count >= MAX_POS or cash < SIZE or SIZE <= 0:
-        return
+    if count >= MAX_POS:
+        return {"status": "capacity", "analysis": analysis}
+    if cash < SIZE or SIZE <= 0:
+        return {"status": "cash", "analysis": analysis}
     token = pair.get("baseToken") or {}
     symbol = (token.get("symbol") or "UNKNOWN")[:20]
     name = (token.get("name") or "")[:60]
@@ -252,6 +254,7 @@ def consider_buy(c, profile, pair):
         symbol, analysis["score"], m["liquidity"], m["volume_5m"],
         m["txns_5m"], m["age_minutes"]
     )
+    return {"status": "bought", "analysis": analysis, "symbol": symbol}
 
 def report(c, snapshots=None):
     cash = float(c.execute("SELECT value FROM state WHERE key='cash'").fetchone()[0])
@@ -315,7 +318,14 @@ def discovery_worker(stop_event):
                     logging.info("DISCOVERY skipped: insufficient paper cash")
                 else:
                     profiles = latest_profiles()
-                    logging.info("Solana profiles received: %d", len(profiles))
+                    stats = {
+                        "profiles": len(profiles), "pairs": 0, "analyzed": 0,
+                        "filtered": 0, "bought": 0, "already_open": 0,
+                        "cooldown": 0, "errors": 0, "capacity": 0, "cash": 0,
+                        "daily_limit": 0
+                    }
+                    reasons = {}
+                    candidates = []
                     for profile in profiles:
                         if stop_event.is_set():
                             break
@@ -324,12 +334,52 @@ def discovery_worker(stop_event):
                             if c.execute(
                                 "SELECT 1 FROM positions WHERE mint=? AND status='OPEN'", (mint,)
                             ).fetchone():
+                                stats["already_open"] += 1
                                 continue
                             pair_list = get_pairs(mint)
-                            if pair_list:
-                                consider_buy(c, profile, pair_list[0])
+                            if not pair_list:
+                                continue
+                            stats["pairs"] += 1
+                            pair = pair_list[0]
+                            preview = analyze_pair(pair, MIN_LIQ, MIN_VOL, MIN_TXNS, MAX_AGE, MIN_SCORE)
+                            stats["analyzed"] += 1
+                            token = pair.get("baseToken") or {}
+                            candidates.append((
+                                preview["score"], (token.get("symbol") or "UNKNOWN")[:20],
+                                preview["metrics"]["liquidity"], preview["metrics"]["volume_5m"],
+                                preview["metrics"]["txns_5m"], preview["eligible"]
+                            ))
+                            result = consider_buy(c, profile, pair)
+                            status = result["status"]
+                            if status == "bought":
+                                stats["bought"] += 1
+                            elif status == "filtered":
+                                stats["filtered"] += 1
+                                for reason in result["analysis"]["reasons"]:
+                                    reasons[reason] = reasons.get(reason, 0) + 1
+                            elif status in stats:
+                                stats[status] += 1
                         except Exception as exc:
+                            stats["errors"] += 1
                             logging.warning("Token scan skipped: %s", exc)
+
+                    logging.info(
+                        "DISCOVERY SUMMARY | profiles=%d | pairs=%d | analyzed=%d | filtered=%d | bought=%d | open=%d | cooldown=%d | errors=%d",
+                        stats["profiles"], stats["pairs"], stats["analyzed"],
+                        stats["filtered"], stats["bought"], stats["already_open"],
+                        stats["cooldown"], stats["errors"]
+                    )
+                    if reasons:
+                        top_reasons = sorted(reasons.items(), key=lambda item: item[1], reverse=True)[:5]
+                        logging.info("FILTER REASONS | %s", " | ".join(
+                            f"{reason}: {amount}" for reason, amount in top_reasons
+                        ))
+                    if candidates:
+                        top = sorted(candidates, key=lambda item: item[0], reverse=True)[:3]
+                        logging.info("TOP CANDIDATES | %s", " | ".join(
+                            f"{symbol} score={score} liq={liq:.0f} vol5m={vol:.0f} tx5m={txns} eligible={eligible}"
+                            for score, symbol, liq, vol, txns, eligible in top
+                        ))
                 report(c)
             except Exception as exc:
                 logging.error("Discovery scan error: %s", exc)
