@@ -1,0 +1,21 @@
+name: Paper MVP syntax check
+
+on:
+  push:
+    branches: [termux-paper-mvp]
+  workflow_dispatch:
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile bot
+        run: python -m py_compile bot.py
+      - name: Import bot without starting scanner
+        run: python -c "import bot; print('IMPORT_OK')"
