@@ -70,7 +70,7 @@ def paper_cycle(c, profile, pair):
         if change <= -STOP or change >= TAKE:
             proceeds = amount * price * (1 - FEE - SLIP)
             cash = c.execute("SELECT value FROM state WHERE key='cash'").fetchone()[0]
-            pnl = proceeds - amount * entry
+            invested = (amount * entry) / (1 - FEE)\n            pnl = proceeds - invested
             c.execute("UPDATE state SET value=? WHERE key='cash'", (cash + proceeds,))
             c.execute("UPDATE positions SET status='CLOSED' WHERE mint=?", (mint,))
             c.execute("INSERT INTO trades(mint,symbol,side,price,amount,pnl,at,note) VALUES(?,?,?,?,?,?,?,?)",
@@ -89,7 +89,7 @@ def paper_cycle(c, profile, pair):
     c.execute("UPDATE state SET value=? WHERE key='cash'", (cash - SIZE,))
     c.execute("INSERT OR REPLACE INTO positions VALUES(?,?,?,?,?,?,?)",
               (mint,symbol,name,effective_price,amount,now,"OPEN"))
-    c.execute("INSERT INTO trades(mint,symbol,side,price,amount,pnl,at,note) VALUES(?,?,?,?,?,?,?,?,?)",
+    c.execute("INSERT INTO trades(mint,symbol,side,price,amount,pnl,at,note) VALUES(?,?,?,?,?,?,?,?)",
               (mint,symbol,"BUY",effective_price,amount,0,now,"paper entry; estimated slippage/fee"))
     c.commit()
     logging.info("PAPER BUY %s | liq=$%.0f | vol5m=$%.0f | age=%.1fm", symbol,liq,vol,age)
